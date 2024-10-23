@@ -1,0 +1,6 @@
+*.jpg
+__pycache__/
+*.sh
+*.csv
+.idea/
+debug_images/
