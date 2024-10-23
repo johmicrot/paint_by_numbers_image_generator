@@ -1,0 +1,7 @@
+flask
+pillow
+numpy
+scikit-image
+matplotlib
+scipy
+scikit-learn

@@ -1,0 +1,36 @@
+// Replace the existing script in index.html with this updated version
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const formData = new FormData(e.target);
+    const submitButton = e.target.querySelector('button[type="submit"]');
+    submitButton.disabled = true;
+    submitButton.textContent = 'Processing...';
+
+    try {
+        const response = await fetch('/upload', {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            if (data.redirect) {
+                window.location.href = data.redirect;
+            } else {
+                document.getElementById('results').style.display = 'block';
+                document.getElementById('originalImage').src = data.original;
+                document.getElementById('labeledImage').src = data.labeled;
+                document.getElementById('labeledNoColorImage').src = data.labeled_no_color;
+            }
+        } else {
+            alert(`Error: ${data.error}`);
+        }
+    } catch (error) {
+        alert('An error occurred while processing the image');
+    } finally {
+        submitButton.disabled = false;
+        submitButton.textContent = 'Generate';
+    }
+});
