@@ -8,6 +8,33 @@ from skimage.segmentation import mark_boundaries
 from collections import Counter
 import logging
 
+# --------------------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------------------
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+
+# --------------------------------------------------------------------------------------------------
+# Utility Functions
+# --------------------------------------------------------------------------------------------------
+
+def is_touching_border(prop, image_shape):
+    """
+    Check if a region touches the image borders.
+
+    Args:
+        prop: Region properties object.
+        image_shape: Tuple of image dimensions (height, width).
+
+    Returns:
+        True if the region touches the image border, False otherwise.
+    """
+    min_row, min_col, max_row, max_col = prop.bbox
+    height, width = image_shape
+    return min_row == 0 or min_col == 0 or max_row == height or max_col == width
+
 
 def get_global_position(prop, local_pos):
     """
@@ -43,6 +70,74 @@ def scale_position(x, y, scale_factor, image_size):
     scaled_x = min(max(scaled_x, 0), image_size[0] - 1)
     scaled_y = min(max(scaled_y, 0), image_size[1] - 1)
     return scaled_x, scaled_y
+
+
+def is_overlapping(new_pos, existing_positions, min_distance=10):
+    """
+    Check if the new position overlaps with existing positions.
+
+    Args:
+        new_pos: Tuple of new position coordinates (x, y).
+        existing_positions: List of existing position tuples.
+        min_distance: Minimum distance to consider positions as non-overlapping.
+
+    Returns:
+        True if overlapping, False otherwise.
+    """
+    for pos in existing_positions:
+        distance = math.hypot(new_pos[0] - pos[0], new_pos[1] - pos[1])
+        if distance < min_distance:
+            logging.debug(
+                f"Overlap detected: New position {new_pos} is {distance:.2f} pixels away from existing position {pos}")
+            return True
+    return False
+
+
+def find_non_overlapping_position(cX, cY, mask, prop, scale_factor, image_size, existing_positions, font_size):
+    """
+    Find a non-overlapping position within the mask.
+
+    Args:
+        cX, cY: Original coordinates.
+        mask: Binary mask of the region.
+        prop: Region properties object.
+        scale_factor: Scaling factor.
+        image_size: Tuple of image dimensions (width, height).
+        existing_positions: List of existing position tuples.
+        font_size: Font size to determine minimum distance.
+
+    Returns:
+        Tuple of new coordinates (cX, cY, cX_scaled, cY_scaled) or None if not found.
+    """
+    shift_distance = font_size
+    directions = [
+        (shift_distance, 0),
+        (-shift_distance, 0),
+        (0, shift_distance),
+        (0, -shift_distance),
+        (shift_distance, shift_distance),
+        (-shift_distance, -shift_distance),
+        (shift_distance, -shift_distance),
+        (-shift_distance, shift_distance)
+    ]
+    for dx, dy in directions:
+        new_cX = cX + dx // scale_factor
+        new_cY = cY + dy // scale_factor
+
+        # Check if new position is within the mask
+        local_new_cY = new_cY - prop.bbox[0]
+        local_new_cX = new_cX - prop.bbox[1]
+        if (0 <= local_new_cY < mask.shape[0] and
+                0 <= local_new_cX < mask.shape[1] and
+                mask[local_new_cY, local_new_cX]):
+
+            # Scale the coordinates
+            scaled_x, scaled_y = scale_position(new_cX, new_cY, scale_factor, image_size)
+
+            if not is_overlapping((scaled_x, scaled_y), existing_positions, min_distance=font_size):
+                return new_cX, new_cY, scaled_x, scaled_y
+    return None  # No suitable position found
+
 
 def load_font(font_path, size):
     """
@@ -139,10 +234,7 @@ def draw_labels_on_image(image, region_props_dict, label_map, scale_factor, font
         # Distance Transform with Padding
         # --------------------------------------------------------------------------------------------------
 
-        # Pad the mask with a border of zeros to handle regions touching the image borders.
-        # This fixes an issue when calculating the location for the label within the shape.
-        # if the shape edge was touching the edge of the local region it would think the label
-        # should go at the border of the shape
+        # Pad the mask with a border of zeros to handle regions touching the image borders
         padded_mask = np.pad(mask, pad_width=1, mode='constant', constant_values=0)
 
         # Compute the distance transform on the padded mask
@@ -180,6 +272,21 @@ def draw_labels_on_image(image, region_props_dict, label_map, scale_factor, font
             font_cache[font_size_adjusted] = load_font("DejaVuSans-Bold.ttf", font_size_adjusted)
         font = font_cache[font_size_adjusted]
 
+        # Check for label overlap
+        if is_overlapping((cX_scaled, cY_scaled), existing_label_positions, min_distance=font_size_adjusted):
+            logging.info(
+                f"Index {idx}: Overlap detected for region {region_label} at ({cX_scaled}, {cY_scaled}). Attempting to shift.")
+            shift_result = find_non_overlapping_position(
+                cX, cY, mask, prop, scale_factor, image_size,
+                existing_label_positions, font_size_adjusted
+            )
+            if shift_result:
+                cX, cY, cX_scaled, cY_scaled = shift_result
+                logging.info(f"Index {idx}: Label for region {region_label} shifted to ({cX_scaled}, {cY_scaled}).")
+            else:
+                logging.warning(f"Index {idx}: Skipping label for region {region_label} due to overlap.")
+                continue  # Skip labeling this region
+
         # Add the position to existing_label_positions
         existing_label_positions.append((cX_scaled, cY_scaled))
 
@@ -187,9 +294,10 @@ def draw_labels_on_image(image, region_props_dict, label_map, scale_factor, font
         # Centering the Label Text
         # --------------------------------------------------------------------------------------------------
 
+        # Print the k-means label
         text = str(kmeans_label)
 
-        # debug: Print both labels (e.g., "Region:KMeans")
+        # debugging print both labels (e.g., "Region:KMeans")
         # text = f"{region_label}:{kmeans_label}"
 
         # Calculate the size of the text to center it
@@ -207,7 +315,7 @@ def draw_labels_on_image(image, region_props_dict, label_map, scale_factor, font
 
 def create_labeled_image(
         kmeans_image, rag_label_image, kmeans_labels, border_color,
-        debug_folder, param_str, scale_factor=2
+        debug_folder, scale_factor=4
 ):
     """
     Creates labeled images with region labels and saves them.
@@ -250,8 +358,8 @@ def create_labeled_image(
     region_props_dict = {prop.label: prop for prop in props}
 
     logging.info('Drawing labels on the upscaled image...')
-    min_font_size = 8 * scale_factor  # Scale the minimum font size
-    max_font_size = 24 * scale_factor  # Scale the maximum font size
+    min_font_size = 4 * scale_factor  # Scale the minimum font size
+    max_font_size = 18 * scale_factor  # Scale the maximum font size
 
     # Draw labels on the larger image
     labeled_larger_image = draw_labels_on_image(
@@ -276,14 +384,6 @@ def create_labeled_image(
 
     # Blend the boundaries with the labeled image
     labeled_image_with_boundaries = Image.blend(labeled_larger_image, boundaries_pil, alpha=0.5)
-
-    # Resize the image back to its original size for saving
-    final_image = labeled_image_with_boundaries.resize((original_size[1], original_size[0]), Image.Resampling.LANCZOS)
-
-    # Save the labeled image with boundaries and set DPI metadata
-    labeled_image_path = os.path.join(debug_folder, f'labeled_image_{param_str}.png')
-    final_image.save(labeled_image_path, dpi=(600, 600))  # Save with high DPI
-    logging.info(f'Labeled image saved as {labeled_image_path}')
 
     # --------------------------------------------------------------------------------------------------
     # Create Labeled Image with White Background
@@ -317,15 +417,12 @@ def create_labeled_image(
 
     # Blend the boundaries with the white background image
     labeled_image_no_color_with_boundaries = Image.blend(labeled_white_image, boundaries_pil_no_color, alpha=0.5)
-
-    # Resize the image back to its original size for saving
-    final_no_color_image = labeled_image_no_color_with_boundaries.resize(
-        (original_size[1], original_size[0]), Image.Resampling.LANCZOS
-    )
+    labeled_image_path = os.path.join(debug_folder, f'labeled_image.png')
+    labeled_image_with_boundaries.save(labeled_image_path)
 
     # Save the labeled image without color
-    labeled_no_color_path = os.path.join(debug_folder, f'labeled_image_no_color_{param_str}.png')
-    final_no_color_image.save(labeled_no_color_path, dpi=(600, 600))  # Save with high DPI
+    labeled_no_color_path = os.path.join(debug_folder, f'labeled_image_no_color.png')
+    labeled_image_no_color_with_boundaries.save(labeled_no_color_path)
     logging.info(f'Labeled image without color saved as {labeled_no_color_path}')
 
 
@@ -334,18 +431,19 @@ def create_labeled_image(
 # --------------------------------------------------------------------------------------------------
 
 """
-Why I Added Padding to the Mask Before Computing the Distance Transform:
+Why We Added Padding to the Mask Before Computing the Distance Transform:
 
 When a region touches the edge of the image, the distance transform may not correctly identify
 the boundaries, since the edge of the image is not considered background. This can lead to
-incorrect distance values and incorrect label placement (e.g., labels placed near the edge or outside the region).
+incorrect distance values and, consequently, incorrect label placement (e.g., labels placed near
+the edge or outside the region).
 
-To address this issue, I pad the mask with a border of zeros (background) before computing the
+To address this issue, we pad the mask with a border of zeros (background) before computing the
 distance transform. This ensures that the edges of the image are treated as boundaries, allowing
 the distance transform to correctly compute distances even for regions touching the image borders.
 
-After computing the distance transform on the padded mask, I adjust the coordinates by subtracting
-the padding to map them back to the original mask coordinates. I also clip the coordinates to
+After computing the distance transform on the padded mask, we adjust the coordinates by subtracting
+the padding to map them back to the original mask coordinates. We also clip the coordinates to
 ensure they are within the bounds of the original mask.
 
 This approach allows us to accurately find the central point of regions, even when they touch the
